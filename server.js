@@ -102,6 +102,16 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/", (_req, res) => res.type("text").send("ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
+app.get("/routes", (_req, res) => {
+  res.json({
+    routes: [
+      "GET /",
+      "GET /health",
+      "POST /actions/search-accounts"
+    ]
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`MCP actions listening on :${PORT}`);
 });
