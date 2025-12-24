@@ -63,6 +63,7 @@ async function soql(query) {
 
 // Healthcheck
 app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/", (_req, res) => res.status(200).send("ok"));
 
 // Action: searchAccounts
 app.post("/actions/search-accounts", requireApiKey, async (req, res) => {
