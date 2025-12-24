@@ -96,22 +96,16 @@ app.post("/actions/search-accounts", requireApiKey, async (req, res) => {
   }
 });
 
-app.get("/", (_req, res) => res.status(200).send("ok"));
-app.get("/health", (_req, res) => res.json({ ok: true }));
-
+// Healthcheck + routes debug
 app.get("/", (_req, res) => res.type("text").send("ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/routes", (_req, res) => res.json({
+  routes: ["GET /", "GET /health", "GET /routes", "POST /actions/search-accounts"]
+}));
 
-app.get("/routes", (_req, res) => {
-  res.json({
-    routes: [
-      "GET /",
-      "GET /health",
-      "POST /actions/search-accounts"
-    ]
-  });
-});
+const port = Number(process.env.PORT || 3000);
 
-app.listen(PORT, () => {
-  console.log(`MCP actions listening on :${PORT}`);
+// IMPORTANT sur Render : écouter sur 0.0.0.0
+app.listen(port, "0.0.0.0", () => {
+  console.log(`MCP actions listening on http://0.0.0.0:${port}`);
 });
