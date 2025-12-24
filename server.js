@@ -1,6 +1,8 @@
 import fetch from "node-fetch";
 import express from "express";
 
+console.log("BOOT: server.js loaded, commit =", process.env.RENDER_GIT_COMMIT || "unknown");
+
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
@@ -95,6 +97,9 @@ app.post("/actions/search-accounts", requireApiKey, async (req, res) => {
 });
 
 app.get("/", (_req, res) => res.status(200).send("ok"));
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+app.get("/", (_req, res) => res.type("text").send("ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => {
