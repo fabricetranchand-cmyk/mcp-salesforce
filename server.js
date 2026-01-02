@@ -55,6 +55,32 @@ async function getAccessToken() {
   return cached.token;
 }
 
+async function handleSearchAccounts(req, res) {
+  try {
+    const name = String(req.body?.name || "").trim();
+    const limitRaw = req.body?.limit ?? 5;
+    const limit = Math.max(1, Math.min(20, Number(limitRaw) || 5));
+
+    if (!name) return res.status(400).json({ error: "Missing 'name' (string)" });
+
+    const safe = name.replace(/'/g, "\\'");
+    const q = `SELECT Id, Name, Industry, BillingCity FROM Account WHERE Name LIKE '%${safe}%' LIMIT ${limit}`;
+
+    const out = await soql(q);
+
+    const records = (out.records || []).map(r => ({
+      id: r.Id,
+      name: r.Name,
+      industry: r.Industry ?? null,
+      city: r.BillingCity ?? null
+    }));
+
+    res.json({ records });
+  } catch (e) {
+    res.status(500).json({ error: "Internal error", details: String(e?.message || e) });
+  }
+}
+
 async function soql(query) {
   const token = await getAccessToken();
   const url = `${SF_INSTANCE_URL}/services/data/${SF_API_VERSION}/query?q=${encodeURIComponent(query)}`;
@@ -67,33 +93,24 @@ async function soql(query) {
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/", (_req, res) => res.status(200).send("ok"));
 
-// Action: searchAccounts
-app.post("/actions/search-accounts", requireApiKey, async (req, res) => {
-  try {
-    const name = String(req.body?.name || "").trim();
-    const limitRaw = req.body?.limit ?? 5;
-    const limit = Math.max(1, Math.min(20, Number(limitRaw) || 5));
-
-    if (!name) return res.status(400).json({ error: "Missing 'name' (string)" });
-
-    // petite protection anti injection SOQL (basique)
-    const safe = name.replace(/'/g, "\\'");
-    const q = `SELECT Id, Name, Industry, BillingCity FROM Account WHERE Name LIKE '%${safe}%' LIMIT ${limit}`;
-
-    const out = await soql(q);
-
-    // réponse IA-friendly
-    const records = (out.records || []).map(r => ({
-      id: r.Id,
-      name: r.Name,
-      industry: r.Industry ?? null,
-      city: r.BillingCity ?? null
-    }));
-
-    res.json({ records });
-  } catch (e) {
-    res.status(500).json({ error: "Internal error", details: String(e?.message || e) });
-  }
+app.get("/tools", requireApiKey, (_req, res) => {
+  res.json({
+    tools: [
+      {
+        name: "search-accounts",
+        description: "Recherche des comptes Salesforce par nom (LIKE %name%)",
+        input_schema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Nom (ou fragment) du compte client" },
+            limit: { type: "integer", minimum: 1, maximum: 20, default: 5 }
+          },
+          required: ["name"],
+          additionalProperties: false
+        }
+      }
+    ]
+  });
 });
 
 // Healthcheck + routes debug
@@ -102,6 +119,13 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/routes", (_req, res) => res.json({
   routes: ["GET /", "GET /health", "GET /routes", "POST /actions/search-accounts"]
 }));
+
+// Ancienne route (tu peux la garder)
+app.post("/actions/search-accounts", requireApiKey, handleSearchAccounts);
+
+// Nouvelle route MCP tool
+app.post("/tools/search-accounts", requireApiKey, handleSearchAccounts);
+
 
 const port = Number(process.env.PORT || 3000);
 
