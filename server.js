@@ -89,10 +89,6 @@ async function soql(query) {
   return r.json();
 }
 
-// Healthcheck
-app.get("/health", (_req, res) => res.json({ ok: true }));
-app.get("/", (_req, res) => res.status(200).send("ok"));
-
 app.get("/tools", requireApiKey, (_req, res) => {
   res.json({
     tools: [
@@ -117,12 +113,18 @@ app.get("/tools", requireApiKey, (_req, res) => {
 app.get("/", (_req, res) => res.type("text").send("ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/routes", (_req, res) => res.json({
-  routes: ["GET /", "GET /health", "GET /routes", "POST /actions/search-accounts"]
+  routes: [
+    "GET /",
+    "GET /health",
+    "GET /routes",
+    "GET /tools (auth)",
+    "POST /tools/search-accounts (auth)",
+    "POST /actions/search-accounts (auth)"
+  ]
 }));
 
 // Ancienne route (tu peux la garder)
 app.post("/actions/search-accounts", requireApiKey, handleSearchAccounts);
-
 // Nouvelle route MCP tool
 app.post("/tools/search-accounts", requireApiKey, handleSearchAccounts);
 
