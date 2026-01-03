@@ -119,13 +119,15 @@ app.get("/routes", (_req, res) => res.json({
     "GET /routes",
     "GET /tools (auth)",
     "POST /tools/search-accounts (auth)",
+    "POST /tools/comptes (auth)",
+    "POST /actions/comptes (auth)",
     "POST /actions/search-accounts (auth)"
   ]
 }));
 
-// Ancienne route (tu peux la garder)
 app.post("/actions/search-accounts", requireApiKey, handleSearchAccounts);
-// Nouvelle route MCP tool
+app.post("/actions/comptes", requireApiKey, handleSearchAccounts);
+app.post("/tools/comptes", requireApiKey, handleSearchAccounts);
 app.post("/tools/search-accounts", requireApiKey, handleSearchAccounts);
 
 
