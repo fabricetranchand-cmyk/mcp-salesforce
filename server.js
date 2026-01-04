@@ -109,13 +109,22 @@ app.get("/tools", requireApiKey, (_req, res) => {
   });
 });
 
+app.get("/test2/health", requireApiKey, (_req, res) => {
+  res.json({
+    TELSI_AUTH: true
+  });
+});
+
 // Healthcheck + routes debug
 app.get("/", (_req, res) => res.type("text").send("ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/test/health", (_req, res) => res.json({ TELSI: true }));
 app.get("/routes", (_req, res) => res.json({
   routes: [
     "GET /",
     "GET /health",
+    "GET /test/health",
+    "GET /test2/health (auth)",
     "GET /routes",
     "GET /tools (auth)",
     "POST /tools/search-accounts (auth)",
