@@ -1,5 +1,6 @@
 import fetch from "node-fetch";
 import express from "express";
+import crypto from "crypto";
 
 console.log("BOOT: server.js loaded, commit =", process.env.RENDER_GIT_COMMIT || "unknown");
 
@@ -13,9 +14,13 @@ const {
   SF_REFRESH_TOKEN,
   SF_INSTANCE_URL,
   SF_API_VERSION = "v60.0",
-  PORT = 3000
+  PORT = 3000,
+  JOB_TTL_SECONDS = "300", // 5 minutes
 } = process.env;
 
+/** -------------------------
+ *  Auth
+ *  ------------------------- */
 function requireApiKey(req, res, next) {
   const auth = req.headers.authorization || "";
   if (!auth.startsWith("Bearer ")) return res.status(401).json({ error: "Missing API key" });
@@ -24,13 +29,15 @@ function requireApiKey(req, res, next) {
   next();
 }
 
+/** -------------------------
+ *  Salesforce token cache
+ *  ------------------------- */
 let cached = { token: null, expiresAt: 0 };
 
 async function getAccessToken() {
   const now = Date.now();
   if (cached.token && cached.expiresAt > now + 30_000) return cached.token;
 
-  // Le plus robuste : utiliser l'instance_url pour le /token
   const tokenUrl = `${SF_INSTANCE_URL}/services/oauth2/token`;
   const body = new URLSearchParams({
     grant_type: "refresh_token",
@@ -55,48 +62,6 @@ async function getAccessToken() {
   return cached.token;
 }
 
-async function handleSearchAccounts(req, res) {
-  try {
-    const name = String(req.body?.name || "").trim();
-    const limitRaw = req.body?.limit ?? 5;
-    const limit = Math.max(1, Math.min(20, Number(limitRaw) || 5));
-
-    if (!name) return res.status(400).json({ error: "Missing 'name' (string)" });
-
-    const safe = name.replace(/'/g, "\\'");
-    const q = `SELECT Id, Name, Industry, BillingCity FROM Account WHERE Name LIKE '%${safe}%' LIMIT ${limit}`;
-    const q2 = `SELECT Id, Name, Website, Industry, Type, BillingCity, NumberOfEmployees, AnnualRevenue, Owner.Name, LastActivityDate, LastModifiedDate FROM Account WHERE Name LIKE '%${safe}%' ORDER BY LastActivityDate DESC NULLS LAST, LastModifiedDate DESC LIMIT ${limit}`
-
-    const out = await soql(q2);
-
-//    const records = (out.records || []).map(r => ({
-//      id: r.Id,
-//      name: r.Name,
-//      industry: r.Industry ?? null,
-//      city: r.BillingCity ?? null
-//    }));
-    const records = (out.records || []).map(r => ({
-      id: r.Id,
-      name: r.Name,
-      webSite: r.Website ?? null,
-      type: r.Type ?? null,
-      webSite: r.Website ?? null,
-      numberOfEmployees: r.NumberOfEmployees ?? null,
-      annualRevenue: r.AnnualRevenue ?? null,
-      owner: r.Owner.Name ?? null,
-      numberOfEmployees: r.NumberOfEmployees ?? null,
-      lastActivityDate: r.LastActivityDate ?? null,
-      lastModifiedDate: r.LastModifiedDate ?? null,
-      industry: r.Industry ?? null,
-      city: r.BillingCity ?? null
-    }));
-
-    res.json({ records });
-  } catch (e) {
-    res.status(500).json({ error: "Internal error", details: String(e?.message || e) });
-  }
-}
-
 async function soql(query) {
   const token = await getAccessToken();
   const url = `${SF_INSTANCE_URL}/services/data/${SF_API_VERSION}/query?q=${encodeURIComponent(query)}`;
@@ -105,6 +70,121 @@ async function soql(query) {
   return r.json();
 }
 
+/** -------------------------
+ *  SSE Job/Event bus (in-memory)
+ *  ------------------------- */
+const jobs = new Map();
+// jobId -> { createdAt, events: Array<{event,data,ts}>, done:boolean, subscribers:Set<res>, ttlTimer }
+
+function sseWrite(res, eventName, payloadObj) {
+  res.write(`event: ${eventName}\n`);
+  res.write(`data: ${JSON.stringify(payloadObj)}\n\n`);
+}
+
+function createJob() {
+  const jobId = crypto.randomUUID();
+  const job = {
+    createdAt: Date.now(),
+    events: [],
+    done: false,
+    subscribers: new Set(),
+    ttlTimer: null,
+  };
+
+  const ttlMs = Math.max(30, Number(JOB_TTL_SECONDS) || 300) * 1000;
+  job.ttlTimer = setTimeout(() => {
+    // Close all subscribers then cleanup
+    for (const res of job.subscribers) {
+      try { res.end(); } catch {}
+    }
+    jobs.delete(jobId);
+  }, ttlMs);
+
+  jobs.set(jobId, job);
+  return jobId;
+}
+
+function pushEvent(jobId, event, data) {
+  const job = jobs.get(jobId);
+  if (!job) return;
+
+  const payload = { event, data, ts: new Date().toISOString() };
+  job.events.push(payload);
+
+  for (const res of job.subscribers) {
+    sseWrite(res, event, payload);
+  }
+}
+
+function finishJob(jobId, ok, data) {
+  pushEvent(jobId, ok ? "result" : "error", data);
+
+  const job = jobs.get(jobId);
+  if (!job) return;
+  job.done = true;
+
+  // Close streams shortly after final event
+  setTimeout(() => {
+    for (const res of job.subscribers) {
+      try { res.end(); } catch {}
+    }
+    job.subscribers.clear();
+  }, 500);
+}
+
+/** -------------------------
+ *  Tool business logic (pure function)
+ *  ------------------------- */
+async function runSearchAccounts({ name, limit }, { jobId } = {}) {
+  // progress helper (no-op if no jobId)
+  const progress = (msg, extra = {}) => jobId && pushEvent(jobId, "progress", { message: msg, ...extra });
+
+  const trimmed = String(name || "").trim();
+  const lim = Math.max(1, Math.min(20, Number(limit) || 5));
+
+  if (!trimmed) {
+    const err = new Error("Missing 'name' (string)");
+    err.status = 400;
+    throw err;
+  }
+
+  progress("Préparation de la requête Salesforce...");
+  const safe = trimmed.replace(/'/g, "\\'");
+
+  // Ta requête enrichie (j’ai retiré ORDER BY ... NULLS LAST si jamais ça pose souci selon l’API)
+  const q = `SELECT Id, Name, Website, Industry, Type, BillingCity, NumberOfEmployees, AnnualRevenue, Owner.Name, LastActivityDate, LastModifiedDate
+             FROM Account
+             WHERE Name LIKE '%${safe}%'
+             ORDER BY LastActivityDate DESC, LastModifiedDate DESC
+             LIMIT ${lim}`;
+
+  progress("Requête SOQL prête.", { limit: lim });
+
+  progress("Interrogation de Salesforce...");
+  const out = await soql(q);
+
+  progress("Mapping des résultats...");
+  const records = (out.records || []).map(r => ({
+    id: r.Id,
+    name: r.Name,
+    website: r.Website ?? null,
+    type: r.Type ?? null,
+    numberOfEmployees: r.NumberOfEmployees ?? null,
+    annualRevenue: r.AnnualRevenue ?? null,
+    owner: r.Owner?.Name ?? null,
+    lastActivityDate: r.LastActivityDate ?? null,
+    lastModifiedDate: r.LastModifiedDate ?? null,
+    industry: r.Industry ?? null,
+    city: r.BillingCity ?? null
+  }));
+
+  progress(`Terminé: ${records.length} résultat(s).`);
+  return { records };
+}
+
+/** -------------------------
+ *  MCP Tools: discovery
+ *  ------------------------- */
 app.get("/tools", requireApiKey, (_req, res) => {
   res.json({
     tools: [
@@ -115,7 +195,7 @@ app.get("/tools", requireApiKey, (_req, res) => {
           type: "object",
           properties: {
             name: { type: "string", description: "Nom (ou fragment) du compte client" },
-            limit: { type: "integer", minimum: 1, maximum: 20, default: 5 }
+            limit: { type: "integer", minimum: 1, maximum: 20, default: 10 }
           },
           required: ["name"],
           additionalProperties: false
@@ -125,40 +205,95 @@ app.get("/tools", requireApiKey, (_req, res) => {
   });
 });
 
-app.get("/test2/health", requireApiKey, (_req, res) => {
-  res.json({
-    TELSI_AUTH: true
-  });
+/** -------------------------
+ *  MCP Tools: start job (async)
+ *  ------------------------- */
+app.post("/tools/search-accounts", requireApiKey, async (req, res) => {
+  const name = req.body?.name;
+  const limit = req.body?.limit ?? 10;
+
+  // Create job + respond immediately
+  const jobId = createJob();
+  res.status(202).json({ job_id: jobId });
+
+  // Run asynchronously, streaming progress on SSE
+  (async () => {
+    try {
+      pushEvent(jobId, "progress", { message: "Démarrage..." });
+      const result = await runSearchAccounts({ name, limit }, { jobId });
+      finishJob(jobId, true, result);
+    } catch (e) {
+      const status = e?.status || 500;
+      finishJob(jobId, false, { status, error: "Internal error", details: String(e?.message || e) });
+    }
+  })();
 });
 
-// Healthcheck + routes debug
+/** -------------------------
+ *  SSE endpoint
+ *  ------------------------- */
+app.get("/sse", requireApiKey, (req, res) => {
+  const jobId = String(req.query.job_id || "").trim();
+  if (!jobId) return res.status(400).json({ error: "Missing job_id" });
+
+  const job = jobs.get(jobId);
+  if (!job) return res.status(404).json({ error: "Unknown job_id (expired or invalid)" });
+
+  // SSE headers
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // for some proxies
+  res.flushHeaders?.();
+
+  // Ready + replay
+  sseWrite(res, "ready", { event: "ready", data: { job_id: jobId }, ts: new Date().toISOString() });
+
+  for (const ev of job.events) {
+    sseWrite(res, ev.event, ev);
+  }
+
+  // Subscribe for live events
+  job.subscribers.add(res);
+
+  // Heartbeat to keep connection alive on Render
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(`event: ping\ndata: ${JSON.stringify({ ts: new Date().toISOString() })}\n\n`);
+    } catch {}
+  }, 25_000);
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    job.subscribers.delete(res);
+  });
+
+  // If job already done, close soon after replay
+  if (job.done) {
+    setTimeout(() => {
+      try { res.end(); } catch {}
+      job.subscribers.delete(res);
+    }, 500);
+  }
+});
+
+/** -------------------------
+ *  Diagnostics
+ *  ------------------------- */
 app.get("/", (_req, res) => res.type("text").send("ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
-app.get("/test/health", (_req, res) => res.json({ TELSI: true }));
 app.get("/routes", (_req, res) => res.json({
   routes: [
     "GET /",
     "GET /health",
-    "GET /test/health",
-    "GET /test2/health (auth)",
     "GET /routes",
     "GET /tools (auth)",
-    "POST /tools/search-accounts (auth)",
-    "POST /tools/comptes (auth)",
-    "POST /actions/comptes (auth)",
-    "POST /actions/search-accounts (auth)"
+    "POST /tools/search-accounts (auth) -> 202 {job_id}",
+    "GET /sse?job_id=... (auth) -> SSE stream"
   ]
 }));
 
-app.post("/actions/search-accounts", requireApiKey, handleSearchAccounts);
-app.post("/actions/comptes", requireApiKey, handleSearchAccounts);
-app.post("/tools/comptes", requireApiKey, handleSearchAccounts);
-app.post("/tools/search-accounts", requireApiKey, handleSearchAccounts);
-
-
-const port = Number(process.env.PORT || 3000);
-
-// IMPORTANT sur Render : écouter sur 0.0.0.0
+const port = Number(PORT || 3000);
 app.listen(port, "0.0.0.0", () => {
-  console.log(`MCP actions listening on http://0.0.0.0:${port}`);
+  console.log(`MCP tools+SSE listening on http://0.0.0.0:${port}`);
 });
