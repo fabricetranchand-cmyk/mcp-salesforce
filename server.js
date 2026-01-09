@@ -65,12 +65,28 @@ async function handleSearchAccounts(req, res) {
 
     const safe = name.replace(/'/g, "\\'");
     const q = `SELECT Id, Name, Industry, BillingCity FROM Account WHERE Name LIKE '%${safe}%' LIMIT ${limit}`;
+    const q2 = `SELECT Id, Name, Website, Industry, Type, BillingCity, NumberOfEmployees, AnnualRevenue, Owner.Name, LastActivityDate, LastModifiedDate FROM Account WHERE Name LIKE '%${safe}%' ORDER BY LastActivityDate DESC NULLS LAST, LastModifiedDate DESC LIMIT ${limit}`
 
-    const out = await soql(q);
+    const out = await soql(q2);
 
+//    const records = (out.records || []).map(r => ({
+//      id: r.Id,
+//      name: r.Name,
+//      industry: r.Industry ?? null,
+//      city: r.BillingCity ?? null
+//    }));
     const records = (out.records || []).map(r => ({
       id: r.Id,
       name: r.Name,
+      webSite: r.Website ?? null,
+      type: r.Type ?? null,
+      webSite: r.Website ?? null,
+      numberOfEmployees: r.NumberOfEmployees ?? null,
+      annualRevenue: r.AnnualRevenue ?? null,
+      owner: r.Owner.Name ?? null,
+      numberOfEmployees: r.NumberOfEmployees ?? null,
+      lastActivityDate: r.LastActivityDate ?? null,
+      lastModifiedDate: r.LastModifiedDate ?? null,
       industry: r.Industry ?? null,
       city: r.BillingCity ?? null
     }));
