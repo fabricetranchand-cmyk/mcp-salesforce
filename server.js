@@ -8,20 +8,21 @@ console.log(
 );
 
 const app = express();
+app.set("trust proxy", 1);
 app.use(express.json({ limit: "1mb" }));
 
 const {
-	MCP_API_KEY,
-	SF_CLIENT_ID,
-	SF_CLIENT_SECRET,
-	SF_REFRESH_TOKEN,
-	SF_INSTANCE_URL,
-	SF_API_VERSION = "v60.0",
-	PORT = 3010,
-	JOB_TTL_SECONDS = "300", // 5 minutes
+  MCP_API_KEY,
+  SF_CLIENT_ID,
+  SF_CLIENT_SECRET,
+  SF_REFRESH_TOKEN,
+  SF_INSTANCE_URL,
+  SF_API_VERSION = "v60.0",
+  PORT,
+  JOB_TTL_SECONDS = "300",
 } = process.env;
-const port = Number(PORT || 3000);
 
+const port = Number(PORT || 3000);
 const MCP_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 /** -------------------------
@@ -87,8 +88,9 @@ const jobs = new Map();
 // jobId -> { createdAt, events: Array<{event,data,ts}>, done:boolean, subscribers:Set<res>, ttlTimer }
 
 function writeJobEvent(res, eventName, payloadObj) {
-	res.write(`event: ${eventName}\n`);
-	res.write(`data: ${JSON.stringify(payloadObj)}\n\n`);
+  if (res.writableEnded) return;
+  res.write(`event: ${eventName}\n`);
+  res.write(`data: ${JSON.stringify(payloadObj)}\n\n`);
 }
 
 function createJob() {
@@ -202,21 +204,6 @@ const MCP_SERVER_NAME = "sse-salesforce";
 const MCP_SERVER_VERSION = "1.0.0";
 const MCP_PROTOCOL_VERSION_FALLBACK = "2024-11-05";
 const mcpSessions = new Map();
-const ttlTimer = setTimeout(() => {
-  const session = mcpSessions.get(sessionId);
-  if (!session) return;
-  try {
-    session.res.end();
-  } catch {}
-  mcpSessions.delete(sessionId);
-  console.log("MCP session TTL expired", { sessionId });
-}, MCP_SESSION_TTL_MS);
-
-mcpSessions.set(sessionId, {
-  res,
-  createdAt: Date.now(),
-  ttlTimer,
-});
 
 const MCP_TOOLS = [
 	{
@@ -350,13 +337,13 @@ async function handleRpcRequest(sessionId, rpc) {
 				return {
 					result: {
 						content: [
-							{
-								type: "text",
-								text: JSON.stringify(result),
-							},
-						],
+						  {
+							type: "text",
+							text: `Recherche terminée : ${result.records.length} compte(s) trouvé(s).`,
+						  },
+    					],
 						structuredContent: result,
-					},
+  					},
 				};
 			} catch (err) {
 				return {
@@ -452,12 +439,23 @@ app.get("/sse", requireApiKey, (req, res) => {
 		res.setHeader("X-Accel-Buffering", "no");
 		res.flushHeaders?.();
 
+		const ttlTimer = setTimeout(() => {
+  			const session = mcpSessions.get(sessionId);
+  			if (!session) return;
+  			try { session.res.end(); } catch {}
+  			mcpSessions.delete(sessionId);
+  			console.log("MCP session TTL expired", { sessionId });
+		}, MCP_SESSION_TTL_MS);
+
 		mcpSessions.set(sessionId, {
-			res,
-			createdAt: Date.now(),
+  			res,
+  			createdAt: Date.now(),
+  			ttlTimer,
 		});
 
-		const base = `${req.protocol}://${req.get("host")}`;
+
+		const proto = (req.headers["x-forwarded-proto"] || "https").toString().split(",")[0].trim();
+		const base = `${proto}://${req.get("host")}`;
 		writeMcpEvent(res, "endpoint", `${base}/message?sessionId=${sessionId}`);
 
 		const heartbeat = setInterval(() => {
@@ -486,14 +484,14 @@ app.get("/sse", requireApiKey, (req, res) => {
 	res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
 	res.setHeader("Cache-Control", "no-cache, no-transform");
 	res.setHeader("Connection", "keep-alive");
-	res.setHeader("X-Accel-Buffering", "no"); // for some proxies
-	res.flushHeaders?.();
+	res.setHeader("X-Accel-Buffering", "no");
+	res.flushHeaders?.(); 
 
 	// Ready + replay
 	writeJobEvent(res, "ready", {
-		event: "ready",
-		data: { job_id: jobId },
-		ts: new Date().toISOString(),
+	  event: "ready",
+	  data: { job_id: jobId },
+	  ts: new Date().toISOString(),
 	});
 
 	for (const ev of job.events) {
@@ -539,6 +537,16 @@ app.post("/message", requireApiKey, async (req, res) => {
 		return res.status(404).json({ error: "Unknown sessionId" });
 	}
 
+	const session = mcpSessions.get(sessionId);
+	if (session?.ttlTimer) clearTimeout(session.ttlTimer);
+	session.ttlTimer = setTimeout(() => {
+	  const s = mcpSessions.get(sessionId);
+	  if (!s) return;
+	  try { s.res.end(); } catch {}
+	  mcpSessions.delete(sessionId);
+	  console.log("MCP session TTL expired", { sessionId });
+	}, MCP_SESSION_TTL_MS);
+	
 	const payload = req.body;
 	if (!payload) {
 		return res.status(400).json({ error: "Missing JSON-RPC payload" });
@@ -591,7 +599,6 @@ app.get("/routes", (_req, res) =>
 	})
 );
 
-const port = Number(PORT || 3000);
 app.listen(port, "0.0.0.0", () => {
 	console.log(`MCP tools+SSE listening on http://0.0.0.0:${port}`);
 });
