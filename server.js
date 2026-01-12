@@ -23,6 +23,38 @@ app.use((err, _req, res, next) => {
 });
 
 /* ============================================================
+ * DEBUG *
+ * ============================================================ */
+app.use(express.text({ type: "*/*", limit: "1mb" })); // capture si la plateforme n'envoie pas JSON
+
+app.all("/debug/echo", (req, res) => {
+  const auth = req.headers.authorization || "";
+  const authHash = auth
+    ? crypto.createHash("sha256").update(auth).digest("hex").slice(0, 12)
+    : null;
+
+  // On évite de renvoyer Authorization / Cookie en clair
+  const headers = { ...req.headers };
+  delete headers.authorization;
+  delete headers.cookie;
+
+  res.status(200).json({
+    method: req.method,
+    url: req.originalUrl,
+    contentType: req.headers["content-type"] || null,
+    hasAuth: Boolean(auth),
+    authHash, // compare curl vs plateforme
+    contentLength: req.headers["content-length"] || null,
+    headers,
+    // body : si JSON -> objet, sinon -> texte brut
+    body: typeof req.body === "string" ? req.body.slice(0, 2000) : req.body,
+  });
+});
+/* ============================================================
+ * FIN DEBUG *
+ * ============================================================ */
+
+/* ============================================================
  *  Env
  * ============================================================ */
 const {
