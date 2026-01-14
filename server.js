@@ -1,3 +1,6 @@
+// server.js
+// NOTE: This file uses ESM imports. Ensure your package.json has: { "type": "module" }
+
 import fetch from "node-fetch";
 import express from "express";
 import crypto from "crypto";
@@ -12,6 +15,8 @@ console.log(
 
 const app = express();
 app.set("trust proxy", 1);
+
+// Parse JSON by default (MCP Streamable HTTP + REST)
 app.use(express.json({ limit: "1mb" }));
 
 /* Optional: return JSON instead of HTML on bad JSON bodies */
@@ -21,38 +26,6 @@ app.use((err, _req, res, next) => {
   }
   next(err);
 });
-
-/* ============================================================
- * DEBUG *
- * ============================================================ */
-app.use(express.text({ type: "*/*", limit: "1mb" })); // capture si la plateforme n'envoie pas JSON
-
-app.all("/debug/echo", (req, res) => {
-  const auth = req.headers.authorization || "";
-  const authHash = auth
-    ? crypto.createHash("sha256").update(auth).digest("hex").slice(0, 12)
-    : null;
-
-  // On évite de renvoyer Authorization / Cookie en clair
-  const headers = { ...req.headers };
-  delete headers.authorization;
-  delete headers.cookie;
-
-  res.status(200).json({
-    method: req.method,
-    url: req.originalUrl,
-    contentType: req.headers["content-type"] || null,
-    hasAuth: Boolean(auth),
-    authHash, // compare curl vs plateforme
-    contentLength: req.headers["content-length"] || null,
-    headers,
-    // body : si JSON -> objet, sinon -> texte brut
-    body: typeof req.body === "string" ? req.body.slice(0, 2000) : req.body,
-  });
-});
-/* ============================================================
- * FIN DEBUG *
- * ============================================================ */
 
 /* ============================================================
  *  Env
@@ -69,7 +42,6 @@ const {
 } = process.env;
 
 const port = Number(PORT || 3000);
-const MCP_SESSION_TTL_MS = 10 * 60 * 1000;
 
 /* ============================================================
  *  Auth
@@ -86,6 +58,38 @@ function requireApiKey(req, res, next) {
 }
 
 /* ============================================================
+ *  DEBUG (scoped)
+ * ============================================================ */
+app.all(
+  "/debug/echo",
+  requireApiKey,
+  // Capture raw body even if platform does not send JSON (scoped ONLY here)
+  express.text({ type: "*/*", limit: "1mb" }),
+  (req, res) => {
+    const auth = req.headers.authorization || "";
+    const authHash = auth
+      ? crypto.createHash("sha256").update(auth).digest("hex").slice(0, 12)
+      : null;
+
+    // Avoid returning Authorization / Cookie in clear
+    const headers = { ...req.headers };
+    delete headers.authorization;
+    delete headers.cookie;
+
+    res.status(200).json({
+      method: req.method,
+      url: req.originalUrl,
+      contentType: req.headers["content-type"] || null,
+      hasAuth: Boolean(auth),
+      authHash, // compare curl vs platform
+      contentLength: req.headers["content-length"] || null,
+      headers,
+      body: typeof req.body === "string" ? req.body.slice(0, 2000) : req.body,
+    });
+  }
+);
+
+/* ============================================================
  *  Salesforce auth
  * ============================================================ */
 let cached = { token: null, expiresAt: 0 };
@@ -93,6 +97,12 @@ let cached = { token: null, expiresAt: 0 };
 async function getAccessToken() {
   const now = Date.now();
   if (cached.token && cached.expiresAt > now + 30_000) return cached.token;
+
+  if (!SF_INSTANCE_URL || !SF_CLIENT_ID || !SF_CLIENT_SECRET || !SF_REFRESH_TOKEN) {
+    const e = new Error("Missing Salesforce env vars (SF_INSTANCE_URL / SF_CLIENT_ID / SF_CLIENT_SECRET / SF_REFRESH_TOKEN)");
+    e.status = 500;
+    throw e;
+  }
 
   const r = await fetch(`${SF_INSTANCE_URL}/services/oauth2/token`, {
     method: "POST",
@@ -261,7 +271,6 @@ function finishJob(jobId, ok, data) {
   pushEvent(jobId, ok ? "result" : "error", data);
   job.done = true;
 
-  // Clear TTL timer once finished (avoid lingering timers)
   if (job.ttlTimer) {
     clearTimeout(job.ttlTimer);
     job.ttlTimer = null;
@@ -299,19 +308,8 @@ app.post("/tools/search-accounts", requireApiKey, async (req, res) => {
 });
 
 /* ============================================================
- *  MCP SSE – sessions
+ *  MCP: Tools catalog (shared)
  * ============================================================ */
-const mcpSessions = new Map();
-
-function writeSse(res, event, data) {
-  if (res.writableEnded) return;
-  res.write(`event: ${event}\n`);
-  // If data is a string, keep it; otherwise JSON
-  const payload = typeof data === "string" ? data : JSON.stringify(data);
-  res.write(`data: ${payload}\n\n`);
-}
-
-/* MCP tools */
 const MCP_TOOLS = [
   {
     name: "search-accounts",
@@ -329,9 +327,184 @@ const MCP_TOOLS = [
 ];
 
 /* ============================================================
+ *  MCP Streamable HTTP (recommended) — single endpoint: /mcp
+ *  This removes the need for SSE transport for modern clients.
+ * ============================================================ */
+const mcpHttpSessions = new Map(); // sessionId -> { expiresAt }
+const MCP_HTTP_SESSION_TTL_MS = 10 * 60 * 1000;
+
+function mcpNow() {
+  return Date.now();
+}
+function mcpNewSessionId() {
+  return crypto.randomUUID();
+}
+function mcpTouchSession(sessionId) {
+  mcpHttpSessions.set(sessionId, { expiresAt: mcpNow() + MCP_HTTP_SESSION_TTL_MS });
+}
+function mcpHasValidSession(sessionId) {
+  const s = mcpHttpSessions.get(sessionId);
+  if (!s) return false;
+  if (s.expiresAt < mcpNow()) {
+    mcpHttpSessions.delete(sessionId);
+    return false;
+  }
+  return true;
+}
+function jsonrpcOk(id, result) {
+  return { jsonrpc: "2.0", id, result };
+}
+function jsonrpcErr(id, code, message, data) {
+  const error = { code, message };
+  if (data !== undefined) error.data = data;
+  return { jsonrpc: "2.0", id: id ?? null, error };
+}
+
+// If you don't support SSE streaming on /mcp, GET can be 405.
+app.get("/mcp", requireApiKey, (_req, res) => res.sendStatus(405));
+
+app.post("/mcp", requireApiKey, async (req, res) => {
+  const payload = req.body;
+
+  const resObj = { headers: {}, httpStatus: 200 };
+
+  const handleOne = async (rpc) => {
+    const { jsonrpc, id, method, params } = rpc ?? {};
+    const isNotification = id === undefined || id === null;
+
+    if (jsonrpc !== "2.0" || typeof method !== "string") {
+      return isNotification ? null : jsonrpcErr(id, -32600, "Invalid Request");
+    }
+
+    // Sessions: if we issue Mcp-Session-Id on initialize, client should send it after.
+    const sessionId = req.header("Mcp-Session-Id");
+    const isInitialize = method === "initialize";
+
+    if (!isInitialize) {
+      if (!sessionId || !mcpHasValidSession(sessionId)) {
+        resObj.httpStatus = 404;
+        return isNotification ? null : jsonrpcErr(id, -32000, "Unknown or expired Mcp-Session-Id");
+      }
+      mcpTouchSession(sessionId);
+    }
+
+    if (method === "initialize") {
+      const newSid = mcpNewSessionId();
+      mcpTouchSession(newSid);
+
+      // Pick a protocolVersion your client expects; 2025-03-26 aligns with Streamable HTTP era.
+      const result = {
+        protocolVersion: "2025-03-26",
+        capabilities: {
+          tools: { listChanged: false },
+          resources: { listChanged: false },
+          prompts: { listChanged: false },
+        },
+        serverInfo: { name: "salesforce-mcp", version: "1.0.0" },
+        instructions: "Use tool search-accounts to find Salesforce accounts.",
+      };
+
+      resObj.headers["Mcp-Session-Id"] = newSid;
+      return isNotification ? null : jsonrpcOk(id, result);
+    }
+
+    if (method === "ping") {
+      return isNotification ? null : jsonrpcOk(id, {});
+    }
+
+    if (method === "tools/list") {
+      return isNotification ? null : jsonrpcOk(id, { tools: MCP_TOOLS });
+    }
+
+    if (method === "tools/call") {
+      const toolName = params?.name;
+      const args = params?.arguments ?? {};
+
+      if (toolName !== "search-accounts") {
+        return isNotification
+          ? null
+          : jsonrpcOk(id, {
+              isError: true,
+              content: [{ type: "text", text: `Unknown tool: ${toolName}` }],
+            });
+      }
+
+      try {
+        const data = await runSearchAccounts(args);
+        return isNotification
+          ? null
+          : jsonrpcOk(id, {
+              content: [
+                { type: "text", text: `Recherche terminée : ${data.records.length} compte(s).` },
+              ],
+              structuredContent: data,
+            });
+      } catch (e) {
+        return isNotification
+          ? null
+          : jsonrpcOk(id, {
+              isError: true,
+              content: [{ type: "text", text: String(e?.message || e) }],
+            });
+      }
+    }
+
+    // Important: Avoid -32601 for standard discovery methods.
+    if (method === "resources/list") {
+      return isNotification ? null : jsonrpcOk(id, { resources: [] });
+    }
+
+    if (method === "prompts/list") {
+      return isNotification ? null : jsonrpcOk(id, { prompts: [] });
+    }
+
+    return isNotification ? null : jsonrpcErr(id, -32601, `Method not found: ${method}`);
+  };
+
+  try {
+    if (Array.isArray(payload)) {
+      const out = [];
+      for (const rpc of payload) {
+        const one = await handleOne(rpc);
+        if (one) out.push(one);
+      }
+      for (const [k, v] of Object.entries(resObj.headers)) res.setHeader(k, v);
+      return res.status(resObj.httpStatus).type("application/json").send(out);
+    }
+
+    const one = await handleOne(payload);
+
+    for (const [k, v] of Object.entries(resObj.headers)) res.setHeader(k, v);
+
+    // Notification => no body
+    if (!one) return res.sendStatus(202);
+
+    return res.status(resObj.httpStatus).type("application/json").send(one);
+  } catch (e) {
+    return res
+      .status(500)
+      .type("application/json")
+      .send(jsonrpcErr(payload?.id, -32603, "Internal error", String(e?.message || e)));
+  }
+});
+
+/* ============================================================
+ *  MCP SSE – legacy transport (deprecated but kept)
+ * ============================================================ */
+const mcpSessions = new Map();
+const MCP_SESSION_TTL_MS = 10 * 60 * 1000;
+
+function writeSse(res, event, data) {
+  if (res.writableEnded) return;
+  res.write(`event: ${event}\n`);
+  const payload = typeof data === "string" ? data : JSON.stringify(data);
+  res.write(`data: ${payload}\n\n`);
+}
+
+/* ============================================================
  *  /sse
  *   - If job_id is present -> legacy job SSE stream
- *   - If job_id is absent  -> MCP SSE session stream
+ *   - If job_id is absent  -> MCP SSE session stream (deprecated)
  * ============================================================ */
 app.get("/sse", requireApiKey, (req, res) => {
   const jobId = String(req.query.job_id || "").trim();
@@ -386,7 +559,7 @@ app.get("/sse", requireApiKey, (req, res) => {
   }
 
   /* ----------------------------
-   * MCP SSE session stream
+   * MCP SSE session stream (deprecated)
    * ---------------------------- */
   const sessionId = crypto.randomUUID();
 
@@ -413,7 +586,10 @@ app.get("/sse", requireApiKey, (req, res) => {
   const base = `${proto}://${req.get("host")}`;
   writeSse(res, "endpoint", `${base}/message?sessionId=${sessionId}`);
 
-  const ping = setInterval(() => writeSse(res, "ping", { ts: new Date().toISOString() }), 25_000);
+  const ping = setInterval(
+    () => writeSse(res, "ping", { ts: new Date().toISOString() }),
+    25_000
+  );
 
   req.on("close", () => {
     clearInterval(ping);
@@ -423,7 +599,7 @@ app.get("/sse", requireApiKey, (req, res) => {
 });
 
 /* ============================================================
- *  MCP JSON-RPC message endpoint
+ *  MCP JSON-RPC message endpoint (legacy SSE transport)
  * ============================================================ */
 function jsonRpcError(code, message, data) {
   const err = { code, message };
@@ -441,7 +617,9 @@ app.post("/message", requireApiKey, async (req, res) => {
   session.ttlTimer = setTimeout(() => {
     const s = mcpSessions.get(sessionId);
     if (!s) return;
-    try { s.res.end(); } catch {}
+    try {
+      s.res.end();
+    } catch {}
     mcpSessions.delete(sessionId);
     console.log("MCP session TTL expired", { sessionId });
   }, MCP_SESSION_TTL_MS);
@@ -449,6 +627,7 @@ app.post("/message", requireApiKey, async (req, res) => {
   const payload = req.body;
   if (!payload) return res.status(400).json({ error: "Missing JSON-RPC payload" });
 
+  // Legacy: ACK immediately, process async over SSE
   res.status(202).end();
 
   const messages = Array.isArray(payload) ? payload : [payload];
@@ -458,7 +637,6 @@ app.post("/message", requireApiKey, async (req, res) => {
     const method = rpc?.method;
     const params = rpc?.params;
 
-    // Notifications (no id) -> ignore replies
     const isNotification = id === undefined || id === null;
 
     try {
@@ -502,6 +680,30 @@ app.post("/message", requireApiKey, async (req, res) => {
         continue;
       }
 
+      /* resources/list (legacy) — return empty to avoid -32601 */
+      if (method === "resources/list") {
+        if (!isNotification) {
+          writeSse(session.res, "message", {
+            jsonrpc: "2.0",
+            id,
+            result: { resources: [] },
+          });
+        }
+        continue;
+      }
+
+      /* prompts/list (legacy) — return empty */
+      if (method === "prompts/list") {
+        if (!isNotification) {
+          writeSse(session.res, "message", {
+            jsonrpc: "2.0",
+            id,
+            result: { prompts: [] },
+          });
+        }
+        continue;
+      }
+
       /* tools/call */
       if (method === "tools/call") {
         const toolName = params?.name;
@@ -526,7 +728,6 @@ app.post("/message", requireApiKey, async (req, res) => {
         const total = 4;
 
         const progress = (message) => {
-          // If token exists, send proper progress notifications
           if (progressToken) {
             step += 1;
             writeSse(session.res, "message", {
@@ -540,7 +741,6 @@ app.post("/message", requireApiKey, async (req, res) => {
               },
             });
           } else {
-            // Otherwise, still emit a lightweight notification
             writeSse(session.res, "message", {
               jsonrpc: "2.0",
               method: "notifications/progress",
@@ -615,17 +815,21 @@ app.post("/message", requireApiKey, async (req, res) => {
 app.get("/", (_req, res) => res.type("text").send("ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/health/sync", (_req, res) => res.json({ ok: true, mode: "sync" }));
+
 app.get("/routes", (_req, res) =>
   res.json({
     routes: [
       "GET / (ok)",
       "GET /health",
-      "POST /api/search-accounts (sync)",
+      "POST /api/search-accounts (sync) [auth]",
       "GET /tools (auth)",
       "POST /tools/search-accounts (auth) -> 202 {job_id} (optional)",
-      "GET /sse (auth) -> MCP SSE session",
-      "POST /message?sessionId=... (auth) -> MCP JSON-RPC",
+      "POST /mcp (auth) -> MCP Streamable HTTP (recommended)",
+      "GET /mcp (auth) -> 405 (no SSE stream here)",
+      "GET /sse (auth) -> MCP SSE session (deprecated legacy)",
+      "POST /message?sessionId=... (auth) -> MCP JSON-RPC over SSE (legacy)",
       "GET /sse?job_id=... (auth) -> legacy job SSE stream (optional)",
+      "ALL /debug/echo (auth) -> request echo",
     ],
   })
 );
