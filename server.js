@@ -381,13 +381,16 @@ app.post("/mcp", requireApiKey, async (req, res) => {
     const sessionId = req.header("Mcp-Session-Id");
     const isInitialize = method === "initialize";
 
-    if (!isInitialize) {
-      if (!sessionId || !mcpHasValidSession(sessionId)) {
+    // Sessions optionnelles : si un client en envoie une, on la valide/touche,
+    // sinon on reste stateless.
+    if (!isInitialize && sessionId) {
+      if (!mcpHasValidSession(sessionId)) {
         resObj.httpStatus = 404;
         return isNotification ? null : jsonrpcErr(id, -32000, "Unknown or expired Mcp-Session-Id");
       }
       mcpTouchSession(sessionId);
     }
+
 
     if (method === "initialize") {
       const newSid = mcpNewSessionId();
