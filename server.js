@@ -99,7 +99,9 @@ async function getAccessToken() {
   if (cached.token && cached.expiresAt > now + 30_000) return cached.token;
 
   if (!SF_INSTANCE_URL || !SF_CLIENT_ID || !SF_CLIENT_SECRET || !SF_REFRESH_TOKEN) {
-    const e = new Error("Missing Salesforce env vars (SF_INSTANCE_URL / SF_CLIENT_ID / SF_CLIENT_SECRET / SF_REFRESH_TOKEN)");
+    const e = new Error(
+      "Missing Salesforce env vars (SF_INSTANCE_URL / SF_CLIENT_ID / SF_CLIENT_SECRET / SF_REFRESH_TOKEN)"
+    );
     e.status = 500;
     throw e;
   }
@@ -328,7 +330,6 @@ const MCP_TOOLS = [
 
 /* ============================================================
  *  MCP Streamable HTTP (recommended) — single endpoint: /mcp
- *  This removes the need for SSE transport for modern clients.
  * ============================================================ */
 const mcpHttpSessions = new Map(); // sessionId -> { expiresAt }
 const MCP_HTTP_SESSION_TTL_MS = 10 * 60 * 1000;
@@ -392,7 +393,6 @@ app.post("/mcp", requireApiKey, async (req, res) => {
       const newSid = mcpNewSessionId();
       mcpTouchSession(newSid);
 
-      // Pick a protocolVersion your client expects; 2025-03-26 aligns with Streamable HTTP era.
       const result = {
         protocolVersion: "2025-03-26",
         capabilities: {
@@ -449,9 +449,14 @@ app.post("/mcp", requireApiKey, async (req, res) => {
       }
     }
 
-    // Important: Avoid -32601 for standard discovery methods.
+    // --- Resource discovery methods (return empty instead of -32601) ---
     if (method === "resources/list") {
       return isNotification ? null : jsonrpcOk(id, { resources: [] });
+    }
+
+    if (method === "resources/templates/list") {
+      // ✅ Fix for: mcp_list_resource_templates_failed
+      return isNotification ? null : jsonrpcOk(id, { resourceTemplates: [] });
     }
 
     if (method === "prompts/list") {
@@ -687,6 +692,18 @@ app.post("/message", requireApiKey, async (req, res) => {
             jsonrpc: "2.0",
             id,
             result: { resources: [] },
+          });
+        }
+        continue;
+      }
+
+      /* resources/templates/list (legacy) — return empty to avoid -32601 */
+      if (method === "resources/templates/list") {
+        if (!isNotification) {
+          writeSse(session.res, "message", {
+            jsonrpc: "2.0",
+            id,
+            result: { resourceTemplates: [] },
           });
         }
         continue;
