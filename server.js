@@ -43,6 +43,18 @@ const {
 
 const port = Number(PORT || 3000);
 
+function requireApiKeySse(req, res, next) {
+  const auth = req.headers.authorization || "";
+  const tokenFromHeader = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  const tokenFromQuery = String(req.query.token || "");
+
+  const token = tokenFromHeader || tokenFromQuery;
+
+  if (!token) return res.status(401).json({ error: "Missing API key" });
+  if (token !== MCP_API_KEY) return res.status(403).json({ error: "Invalid API key" });
+  next();
+}
+
 /* ============================================================
  *  Auth
  * ============================================================ */
@@ -514,7 +526,7 @@ function writeSse(res, event, data) {
  *   - If job_id is present -> legacy job SSE stream
  *   - If job_id is absent  -> MCP SSE session stream (deprecated)
  * ============================================================ */
-app.get("/sse", requireApiKey, (req, res) => {
+app.get("/sse", requireApiKeySse, (req, res) => {
   const jobId = String(req.query.job_id || "").trim();
 
   /* ----------------------------
